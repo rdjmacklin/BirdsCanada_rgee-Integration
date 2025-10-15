@@ -1,0 +1,118 @@
+---
+title: "ree-Integration-Testing"
+author: "Rory Macklin (rmacklin@birdscanada.org)"
+format: html
+editor: visual
+---
+
+# Goal
+
+In this document, we aim to demonstrate how a Nature Counts user may pull Information from Google Earth Engine and pair it to a dataset from Nature Counts. We demonstrate this using data from the British Columbia Marsh Monitoring Program which can be accessed via <https://www.doi.org/10.71842/3266-q231>. This is part of Birds Canada's commitment incorporate earth observation data download into the naturecounts R package.
+
+# Code
+
+## Setup
+
+Upon downloading this repository, execute the included setup script to create necessary directories and load required packages.
+
+```{r}
+
+source("./Scripts/00_Setup.R")
+
+nc_login <- readline(prompt = "Enter Nature Counts username: ")
+nc_reqid <- as.numeric(readline(prompt = "Enter Nature Counts request id: "))
+
+ee_login <- readline(prompt = "Enter Google Account to authenticate GEE with: ")
+```
+
+## Downloading naturecounts data.
+
+Here, we download data from the BC Marsh Monitoring Program using the provided Nature Counts login info. We will convert this object into a spatial features (sf) object with each point buffered to a radial distance of 500m (the user can adjust this by modifying the *radius* object below).
+
+```{r}
+
+if(!file.exists("./Data/Raw/bcmmp.csv")) {
+  
+  dat <- nc_data_dl(username = nc_login, request_id = nc_reqid)
+
+  write_csv(dat, "./Data/Raw/bcmmp.csv")
+  
+} else {
+  
+  dat <- read_csv("./Data/Raw/bcmmp.csv")
+  
+}
+
+dat_sf <- dat %>%
+  filter(!(is.na(latitude) | is.na(longitude))) %>%
+  select(SiteCode, latitude, longitude, survey_year, survey_month, survey_day) %>%
+  distinct() %>%
+  arrange(SiteCode, survey_year, survey_month) %>%
+  st_as_sf(coords = c("longitude", "latitude"), crs = 4326) %>%
+  st_transform("ESRI:102001")
+
+radius <- 500
+
+dat_buff <- st_buffer(dat_sf, radius)
+```
+
+## Google Earth Engine
+
+We will attempt to install the dependencies needed to interface with Google Earth Engine through the *rgee* package. This can be a bit complex, so troubleshooting may be necessary. See <https://r-spatial.github.io/rgee/articles/rgee01.html> for assistance.
+
+```{r}
+
+# Install the python dependencies for rgee
+
+py_dir <- "C:/Users/rmacklin/Desktop/Repositories/BirdsCanada_rgee-Integration/Miniconda"
+
+reticulate::install_miniconda(path = py_dir)
+
+Sys.setenv("RETICULATE_PYTHON" = paste0(py_dir, "/python"))
+
+ee_install_set_pyenv(py_env = "rgee", py_path = paste0(py_dir, "/python"))
+
+ee_install()
+
+# Initialize rgee - this will redirect you to a Google authorization area where you
+# must login and give permission for the API to access some aspects of the account
+# you wish to use.
+
+ee_Initialize(user = ee_login)
+
+ee_Authenticate(user = ee_login)
+
+ee$Initialize(project = "hip-rain-474723-m3")
+
+# We'll access a few different data resources covering commonly applied covariates
+# with bird data and different temporal resolutions. First, lets get a static elevation
+# dataset.
+
+elev <- ee$Image("CGIAR/SRTM90_V4")
+
+for(i in unique(dat_buff$SiteCode)) {
+  
+  tmp <- dat_buff %>%
+    filter(SiteCode == i) %>%
+    select(SiteCode, geometry) %>%
+    distinct()
+  
+  suppressWarnings(
+    
+      dat_buff$elevation[dat_buff$SiteCode == i] <- ee_extract(elev, tmp, fun = ee$Reducer$mean(), scale = 90)$elevation
+    
+  )
+
+}
+
+# Second, lets get land cover data at an annual resolution.
+
+modis <- ee$ImageCollection("MODIS/061/MCD12Q1")
+
+modis_year <- modis$select("LC_Type1")$filterDate("2021-01-01", "2021-12-31")$first()
+
+tmp <- sf_as_ee(dat_buff[1,])
+
+modis_clipped <- modis_year$clip(tmp)
+
+```
